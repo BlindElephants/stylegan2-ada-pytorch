@@ -10,32 +10,52 @@ import torch
 from pythonosc import dispatcher, osc_server
 from threading import Thread, Lock
 
+outSize = (1024, 1024)
+
+
 mutex = Lock()
 
+receiveLatentDirty = False
+receiveLatent = []
+
+
+def receiveLatentVector(addr, *args):
+    global receiveLatentDirty, receiveLatent
+    if len(args) != 512:
+        print('Invalid latent vector size received: {}'.format(len(args)))
+        return
+
+    with mutex:
+        receiveLatent = np.array(args).reshape(1, 512)
+        receiveLatentDirty = True
+
+
+dispatcher = dispatcher.Dispatcher()
+dispatcher.map('/latent', receiveLatentVector)
+oscListener = osc_server.ThreadingOSCUDPServer(('0.0.0.0', 8889), dispatcher)
+oscListenerThread = Thread(target=oscListener.serve_forever, args=())
+print("Starting OSC listener thread.")
+oscListenerThread.start()
 
 INPUT_MODEL = os.path.join('data', 'network-snapshot-000000.pkl')
-print(os.path.exists(INPUT_MODEL))
-
 with open(INPUT_MODEL, 'rb') as f:
     model = pickle.load(f)['G_ema'].cuda()
 
 model.eval()
 
 r = np.random.rand(1, 512)
-r = torch.as_tensor(r, device='cuda')
 
-out = model(r, None)
-out = (out.permute(0, 2, 3, 1) * 0.5 + 0.5019607843137255).clamp(0.0, 1.0)
-out = out.reshape(1024, 1024, 3).detach().cpu().numpy()
 
-print(out.shape)
+def get_image_from_numpy_array(latent_vector: np.array):
+    out_img = torch.as_tensor(latent_vector, device='cuda')
+    out_img = model(out_img, None, noise_mode='const')
+    out_img = (out_img.permute(0, 2, 3, 1) * 0.5 + 0.5019607843137255).clamp(0.0, 1.0)
+    out_img = out_img.reshape(1024, 1024, 3).detach().cpu().numpy()
+    return out_img
 
-img = out
 
-print(img.min())
-print(img.max())
+img = get_image_from_numpy_array(np.random.rand(1, 512))
 
-outSize = (1024, 1024)
 
 pygame.init()
 pygame.display.set_caption('AI Video Project')
@@ -58,11 +78,13 @@ glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
 glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
 glBindTexture(GL_TEXTURE_2D, 0)
 
-# img = np.random.rand(1024, 1024, 3)
-# print(img.shape)
 
 def update():
-    # img = np.random.rand(1024, 1024, 3)
+    global receiveLatentDirty, receiveLatent, img
+
+    if receiveLatentDirty:
+        img = get_image_from_numpy_array(receiveLatent)
+        receiveLatentDirty = False
 
     glBindTexture(GL_TEXTURE_2D, senderTexture)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, outSize[0], outSize[1], 0, GL_RGB, GL_FLOAT, img)
@@ -86,6 +108,7 @@ def update():
     pygame.display.flip()
     glBindTexture(GL_TEXTURE_2D, 0)
 
+
 while True:
     update()
 
@@ -93,4 +116,7 @@ while True:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 pygame.quit()
+                oscListener.server_close()
+                oscListener.shutdown()
+                oscListenerThread.join(timeout=2.0)
                 quit()
